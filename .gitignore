@@ -1,0 +1,44 @@
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# Build and distribution
+build/
+dist/
+*.spec
+
+# Generated data
+recovered/
+reports/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Recovery output and test artifacts
+recovered/
+recovered_test/
+recovered_cli_test/
+reports/
+
+# Disk images
+*.img
+*.dd
+*.raw
+*.e01

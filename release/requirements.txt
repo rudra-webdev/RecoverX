@@ -1,0 +1,6 @@
+# RecoverX — Dependency Requirements
+# Core testing, validation, and GUI desktop frameworks
+
+pytest>=8.0.0,<10.0.0    # Automated forensic test suite
+Pillow>=10.0.0,<14.0.0   # Image decoding, structural validation & thumbnail generation
+PySide6>=6.5.0,<7.0.0    # Modern dark forensic desktop GUI platform
