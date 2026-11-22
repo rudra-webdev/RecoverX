@@ -247,6 +247,22 @@ class FileValidator:
         width, height = struct.unpack(">II", data[16:24])
         details["dimensions_raw"] = f"{width}x{height}"
 
+        # Deep chunk CRC verification
+        from utils.file_signatures import parse_png_size
+        png_total_len = parse_png_size(data, offset=0, verify_crc=True)
+        if png_total_len is None:
+            return cls._create_result(
+                is_valid=False,
+                signature_detected=True,
+                structure_validated=False,
+                content_readable=False,
+                confidence=0.25,
+                file_type="png",
+                details=details,
+                error="PNG chunk structure or CRC-32 integrity failure",
+                status="CORRUPT_STRUCTURE"
+            )
+
         if PILLOW_AVAILABLE:
             try:
                 img = Image.open(io.BytesIO(data))

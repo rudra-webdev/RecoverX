@@ -38,23 +38,51 @@ IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 IOCTL_DISK_GET_LENGTH_INFO = 0x00074059
 IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
 
+def normalize_device_path(path_input: Union[str, Path]) -> str:
+    """
+    Normalizes a path to Windows device namespace if it represents a drive letter or raw device.
+    Examples:
+    - 'F:' or 'F:\\' or 'f:' -> '\\\\.\\F:'
+    - '\\\\.\\PhysicalDrive1' -> '\\\\.\\PhysicalDrive1'
+    - 'sample.img' -> 'sample.img'
+    """
+    p = str(path_input).strip().replace("/", "\\")
+    if p.startswith("\\\\.\\") or p.startswith("\\\\?\\"):
+        return p
+    # Drive letter checks e.g. "C:", "C:\", "f:", "f:\"
+    if len(p) == 2 and p[1] == ":" and p[0].isalpha():
+        return f"\\\\.\\{p.upper()}"
+    if len(p) == 3 and p[1] == ":" and p[2] == "\\" and p[0].isalpha():
+        return f"\\\\.\\{p[:2].upper()}"
+    return p
+
+def is_raw_device_path(path: Union[str, Path]) -> bool:
+    """Determines if the path targets a Win32 device namespace or raw drive letter."""
+    norm = normalize_device_path(path)
+    return norm.startswith("\\\\.\\") or norm.startswith("\\\\?\\")
+
 class Win32RawDeviceReader:
     """
     Forensic read-only stream for Windows physical drives (\\\\.\\PhysicalDriveX),
-    raw volumes (\\\\.\\C:), and disk image files.
+    raw volumes (\\\\.\\C:), logical drive letters (F:, F:\\), and disk image files.
     """
     def __init__(self, device_path: Union[str, Path], sector_size: int = 512):
-        self.device_path = str(device_path)
+        self.raw_input_path = str(device_path)
+        self.device_path = normalize_device_path(device_path)
         self.sector_size = sector_size
         self._handle = None
         self._file_obj = None  # Fallback for standard files/images
         self._position = 0
         self._total_size: Optional[int] = None
         self._is_win32_handle = False
+        self.bytes_read = 0
+        self.bytes_attempted = 0
+        self.read_errors = 0
+        self.unreadable_ranges: list = []
 
     @property
     def is_raw_device(self) -> bool:
-        """Determines if the path targets a Win32 device namespace."""
+        """Determines if the normalized path targets a Win32 device namespace."""
         norm = self.device_path.replace("/", "\\")
         return norm.startswith("\\\\.\\") or norm.startswith("\\\\?\\")
 
@@ -62,7 +90,7 @@ class Win32RawDeviceReader:
         """Opens the source in strict read-only mode."""
         if not self.is_raw_device:
             # Standard file / disk image: open with standard Python rb
-            path = Path(self.device_path).resolve()
+            path = Path(self.raw_input_path).resolve()
             if not path.is_file():
                 raise FileNotFoundError(f"Source file or image does not exist: {path}")
             self._file_obj = open(path, "rb")
@@ -117,15 +145,45 @@ class Win32RawDeviceReader:
         return self
 
     def _query_device_size(self) -> int:
-        """Queries physical size of the opened device using IOCTL."""
+        """Queries physical size of the opened device or drive letter using Win32 APIs."""
         if not self._is_win32_handle:
+            if self._file_obj:
+                curr = self._file_obj.tell()
+                self._file_obj.seek(0, os.SEEK_END)
+                sz = self._file_obj.tell()
+                self._file_obj.seek(curr, os.SEEK_SET)
+                return sz
             return self._total_size or 0
 
+        # 1. If drive letter, query capacity via GetDiskFreeSpaceExW
+        drive_letter = None
+        raw_p = self.raw_input_path.strip().replace("/", "\\")
+        if len(raw_p) >= 2 and raw_p[1] == ":" and raw_p[0].isalpha():
+            drive_letter = f"{raw_p[:2].upper()}\\"
+        elif self.device_path.startswith("\\\\.\\") and len(self.device_path) == 6 and self.device_path[5] == ":":
+            drive_letter = f"{self.device_path[4:6].upper()}\\"
+
+        if drive_letter and sys.platform == "win32":
+            try:
+                free_b = ctypes.c_ulonglong(0)
+                total_b = ctypes.c_ulonglong(0)
+                total_free = ctypes.c_ulonglong(0)
+                if ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                    drive_letter,
+                    ctypes.byref(free_b),
+                    ctypes.byref(total_b),
+                    ctypes.byref(total_free)
+                ):
+                    if total_b.value > 0:
+                        return total_b.value
+            except Exception:
+                pass
+
+        # 2. IOCTL_DISK_GET_LENGTH_INFO (0x00074059)
         kernel32 = ctypes.windll.kernel32
         length_info = ctypes.c_int64(0)
         bytes_returned = wintypes.DWORD(0)
 
-        # IOCTL_DISK_GET_LENGTH_INFO (0x00074059)
         success = kernel32.DeviceIoControl(
             self._handle,
             IOCTL_DISK_GET_LENGTH_INFO,
@@ -137,13 +195,12 @@ class Win32RawDeviceReader:
         if success and length_info.value > 0:
             return length_info.value
 
-        # Fallback to seek end
+        # 3. Fallback to seek end
         li_dist = ctypes.c_int64(0)
         li_new_pos = ctypes.c_int64(0)
         res = kernel32.SetFilePointerEx(self._handle, li_dist, ctypes.byref(li_new_pos), FILE_END)
         if res:
             end_pos = li_new_pos.value
-            # Reset back to start
             kernel32.SetFilePointerEx(self._handle, li_dist, None, FILE_BEGIN)
             return end_pos
 
@@ -159,6 +216,8 @@ class Win32RawDeviceReader:
                 raise ValueError("Stream is closed")
             data = self._file_obj.read(n)
             self._position = self._file_obj.tell()
+            self.bytes_read += len(data)
+            self.bytes_attempted += n if n > 0 else len(data)
             return data
 
         if self._handle is None:
@@ -172,6 +231,7 @@ class Win32RawDeviceReader:
         if n == 0:
             return b""
 
+        self.bytes_attempted += n
         kernel32 = ctypes.windll.kernel32
         buf = ctypes.create_string_buffer(n)
         bytes_read = wintypes.DWORD(0)
@@ -188,10 +248,13 @@ class Win32RawDeviceReader:
             err = kernel32.GetLastError()
             if err == 38:  # ERROR_HANDLE_EOF
                 return b""
+            self.read_errors += 1
+            self.unreadable_ranges.append((self._position, self._position + n))
             raise OSError(f"Error reading from Win32 device '{self.device_path}' (Win32 Error: {err})")
 
         actual = bytes_read.value
         self._position += actual
+        self.bytes_read += actual
         return buf.raw[:actual]
 
     def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
@@ -237,6 +300,30 @@ class Win32RawDeviceReader:
                 self._file_obj.seek(0, os.SEEK_END)
                 self._total_size = self._file_obj.tell()
                 self._file_obj.seek(curr, os.SEEK_SET)
+            else:
+                # Query size prior to handle open if applicable
+                drive_letter = None
+                raw_p = self.raw_input_path.strip().replace("/", "\\")
+                if len(raw_p) >= 2 and raw_p[1] == ":" and raw_p[0].isalpha():
+                    drive_letter = f"{raw_p[:2].upper()}\\"
+                elif self.device_path.startswith("\\\\.\\") and len(self.device_path) == 6 and self.device_path[5] == ":":
+                    drive_letter = f"{self.device_path[4:6].upper()}\\"
+
+                if drive_letter and sys.platform == "win32":
+                    try:
+                        free_b = ctypes.c_ulonglong(0)
+                        total_b = ctypes.c_ulonglong(0)
+                        total_free = ctypes.c_ulonglong(0)
+                        if ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                            drive_letter, ctypes.byref(free_b), ctypes.byref(total_b), ctypes.byref(total_free)
+                        ):
+                            if total_b.value > 0:
+                                self._total_size = total_b.value
+                    except Exception:
+                        pass
+                if (not self._total_size) and Path(self.raw_input_path).is_file():
+                    self._total_size = Path(self.raw_input_path).stat().st_size
+
         return self._total_size or 0
 
     def close(self) -> None:

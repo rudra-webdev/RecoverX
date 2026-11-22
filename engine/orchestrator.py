@@ -13,6 +13,7 @@ import datetime
 import uuid
 
 from engine.signature_scanner import SignatureScanner, CarvedItem
+from engine.win32_raw_reader import is_raw_device_path
 from integrations.photorec.runner import PhotoRecIntegration
 from integrations.sleuthkit.runner import TheSleuthKitIntegration
 from engine.file_validator import FileValidator
@@ -73,10 +74,12 @@ class UnifiedArtifact:
             "inode": self.inode_or_meta_id,
             "size_bytes": self.extracted_size,
             "length": self.extracted_size,
+            "extracted_size": self.extracted_size,
             "original_size": self.original_size,
             "backend": self.recovery_engine,
             "recovery_engine": self.recovery_engine,
             "status": self.recovery_status,
+            "recovery_status": self.recovery_status,
             "is_valid": self.validation_result.get("is_valid", False),
             "confidence": self.validation_result.get("confidence", 0.8),
             "sha256": self.sha256,
@@ -115,14 +118,27 @@ class RecoveryOrchestrator:
         """
         Runs configured engines against source path and merges/deduplicates artifacts.
         """
-        source_resolved = Path(source_path).resolve()
+        is_raw = is_raw_device_path(source_path)
+        source_is_file = False
+        source_display_name = str(source_path)
+        try:
+            source_p = Path(source_path)
+            if not is_raw and source_p.is_file():
+                source_resolved = source_p.resolve()
+                source_is_file = True
+                source_display_name = source_resolved.name
+            else:
+                source_resolved = source_path
+        except Exception:
+            source_resolved = source_path
+
         artifacts_by_key: Dict[str, UnifiedArtifact] = {}
 
         # 1. The Sleuth Kit (Filesystem Metadata Discovery)
         if self.use_tsk and self.tsk:
             tsk_status = self.tsk.get_status()
-            if tsk_status.get("is_available") and source_resolved.is_file():
-                logger.info(f"[Orchestrator] Running The Sleuth Kit on {source_resolved.name}...")
+            if tsk_status.get("is_available") and (source_is_file or is_raw):
+                logger.info(f"[Orchestrator] Running The Sleuth Kit on {source_display_name}...")
                 try:
                     tsk_entries = self.tsk.find_deleted_entries(source_resolved)
                     for entry in tsk_entries:
@@ -154,8 +170,8 @@ class RecoveryOrchestrator:
                     logger.warning(f"[Orchestrator] TSK scan failed: {e}")
 
         # 2. RecoverX Native Signature Carver
-        if self.use_native_carver and self.native_scanner and source_resolved.is_file():
-            logger.info(f"[Orchestrator] Running RecoverX Carver on {source_resolved.name}...")
+        if self.use_native_carver and self.native_scanner and (source_is_file or is_raw or Path(source_path).exists()):
+            logger.info(f"[Orchestrator] Running RecoverX Carver on {source_display_name}...")
             try:
                 def on_carve_item(item: CarvedItem):
                     if is_cancelled and is_cancelled():
@@ -203,12 +219,13 @@ class RecoveryOrchestrator:
                 )
             except Exception as e:
                 logger.error(f"[Orchestrator] RecoverX carving failed: {e}")
+                raise
 
         # 3. PhotoRec Integration (if requested and available)
-        if self.use_photorec and self.photorec and source_resolved.is_file():
+        if self.use_photorec and self.photorec and (source_is_file or is_raw):
             pr_status = self.photorec.get_status()
             if pr_status.get("is_available"):
-                logger.info(f"[Orchestrator] Running PhotoRec on {source_resolved.name}...")
+                logger.info(f"[Orchestrator] Running PhotoRec on {source_display_name}...")
                 try:
                     import tempfile
                     with tempfile.TemporaryDirectory(prefix="recoverx_pr_") as pr_tmp:

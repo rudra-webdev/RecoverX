@@ -44,12 +44,27 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            if not self.source_path.exists():
+            from engine.win32_raw_reader import Win32RawDeviceReader, is_raw_device_path
+
+            is_raw = is_raw_device_path(self.source_path)
+            if not is_raw and not self.source_path.exists():
                 self.scan_error.emit(f"Source path does not exist: {self.source_path}")
                 return
 
-            file_size = self.source_path.stat().st_size
+            # Determine real device/image size accurately
+            file_size = 0
+            try:
+                reader = Win32RawDeviceReader(self.source_path)
+                file_size = reader.get_size()
+            except PermissionError as pe:
+                self.scan_error.emit(str(pe))
+                return
+            except Exception:
+                if not is_raw and self.source_path.is_file():
+                    file_size = self.source_path.stat().st_size
+
             discovered_items = []
+            bytes_scanned = [0]
 
             orchestrator = RecoveryOrchestrator(
                 use_native_carver=True,
@@ -58,9 +73,11 @@ class ScanWorker(QThread):
             )
 
             def on_progress(current, total):
-                if not self._is_cancelled and total > 0:
-                    pct = int((current / total) * 100)
-                    self.progress_updated.emit(current, total, pct)
+                if not self._is_cancelled:
+                    bytes_scanned[0] = current
+                    if total > 0:
+                        pct = int((current / total) * 100)
+                        self.progress_updated.emit(current, total, pct)
 
             def on_item(item_dict: dict):
                 if not self._is_cancelled:
@@ -74,12 +91,22 @@ class ScanWorker(QThread):
                 is_cancelled=lambda: self._is_cancelled
             )
 
+            actual_bytes = bytes_scanned[0]
+            if actual_bytes == 0 and file_size > 0 and len(discovered_items) == 0:
+                self.scan_error.emit(
+                    f"Forensic Scan Failure: 0 bytes processed from '{self.source_path}'.\n\n"
+                    "Direct physical or volume access on Windows requires Administrator privileges. "
+                    "Please restart RecoverX as Administrator, or verify the drive is mounted and readable."
+                )
+                return
+
             valid_count = sum(1 for i in discovered_items if i.get("is_valid", False))
             dup_count = sum(1 for i in discovered_items if i.get("is_duplicate", False))
 
             summary = {
                 "source_path": str(self.source_path),
                 "file_size": file_size,
+                "bytes_scanned": actual_bytes if actual_bytes > 0 else file_size,
                 "total_items": len(discovered_items),
                 "valid_items": valid_count,
                 "duplicate_items": dup_count,
@@ -87,6 +114,9 @@ class ScanWorker(QThread):
             }
             self.scan_finished.emit(summary)
 
+        except PermissionError as pe:
+            logger.error(f"Permission denied during scan worker execution: {pe}")
+            self.scan_error.emit(str(pe))
         except Exception as e:
             logger.error(f"Error during scan worker execution: {e}")
             self.scan_error.emit(str(e))

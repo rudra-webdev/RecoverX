@@ -58,9 +58,10 @@ class StorageScanner:
         logger.warning(f"Opening physical drive {drive_path} in STRICT READ-ONLY mode.")
         # Only open for read
         try:
-            with open(drive_path, "rb") as f:
+            from engine.win32_raw_reader import Win32RawDeviceReader
+            with Win32RawDeviceReader(drive_path) as reader:
                 # Read first sector to verify accessibility
-                mbr = f.read(512)
+                mbr = reader.read(512)
                 if len(mbr) < 512:
                     raise IOError("Unable to read disk geometry from target physical drive.")
         except Exception as e:

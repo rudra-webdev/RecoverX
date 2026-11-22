@@ -83,7 +83,13 @@ class SignatureScanner:
             return SIGNATURE_DATABASE
         return [sig for sig in SIGNATURE_DATABASE if sig.extension in self.target_formats]
 
-    def scan_bytes(self, data: bytes, base_offset: int = 0, item_callback: Optional[Callable[[CarvedItem], None]] = None) -> List[CarvedItem]:
+    def scan_bytes(
+        self,
+        data: bytes,
+        base_offset: int = 0,
+        item_callback: Optional[Callable[[CarvedItem], None]] = None,
+        reader: Any = None
+    ) -> List[CarvedItem]:
         """Carves supported files from an in-memory byte buffer using fast C-level pattern search."""
         carved_items: List[CarvedItem] = []
         data_len = len(data)
@@ -118,7 +124,14 @@ class SignatureScanner:
                 # Skip candidate if it falls inside a previously carved valid item
                 continue
 
-            carve_res = self._carve_candidate(data, box_start, sig.extension)
+            abs_cand_offset = base_offset + box_start
+            carve_res = self._carve_candidate(
+                data,
+                box_start,
+                sig.extension,
+                reader=reader,
+                abs_offset=abs_cand_offset
+            )
             if carve_res:
                 carved_bytes, estimated_len, is_frag = carve_res
                 if len(carved_bytes) >= sig.min_size:
@@ -131,7 +144,7 @@ class SignatureScanner:
                     detected_cat = validation.get("category", sig.category)
 
                     item = CarvedItem(
-                        offset=base_offset + box_start,
+                        offset=abs_cand_offset,
                         length=len(carved_bytes),
                         extension=detected_ext,
                         data=carved_bytes,
@@ -151,8 +164,15 @@ class SignatureScanner:
 
         return carved_items
 
-    def _carve_candidate(self, data: bytes, offset: int, ext: str) -> Optional[tuple[bytes, int, bool]]:
-        """Determines boundaries and extracts carved bytes. Returns (bytes, len, is_fragmented)."""
+    def _carve_candidate(
+        self,
+        data: bytes,
+        offset: int,
+        ext: str,
+        reader: Any = None,
+        abs_offset: int = 0
+    ) -> Optional[tuple[bytes, int, bool]]:
+        """Determines boundaries and extracts carved bytes. Supports reader lookahead across chunk boundaries."""
         sub = data[offset:]
         sub_len = len(sub)
         if sub_len == 0:
@@ -167,23 +187,85 @@ class SignatureScanner:
             length = parse_bmp_size(sub, 0)
         elif ext == "png":
             length = parse_png_size(sub, 0)
+            if length is None and reader is not None:
+                # PNG might extend past chunk boundary: read ahead from reader
+                curr_pos = reader.tell()
+                try:
+                    reader.seek(abs_offset)
+                    ahead_chunk = reader.read(min(MAX_CARVE_FILE_SIZE, 32 * 1024 * 1024))
+                    ext_len = parse_png_size(ahead_chunk, 0)
+                    if ext_len is not None and ext_len <= len(ahead_chunk):
+                        return ahead_chunk[:ext_len], ext_len, False
+                except Exception:
+                    pass
+                finally:
+                    reader.seek(curr_pos)
         elif ext == "zip":
             length = parse_zip_size(sub, 0)
+            if length is None and reader is not None:
+                curr_pos = reader.tell()
+                try:
+                    reader.seek(abs_offset)
+                    ahead_chunk = reader.read(min(MAX_CARVE_FILE_SIZE, 32 * 1024 * 1024))
+                    ext_len = parse_zip_size(ahead_chunk, 0)
+                    if ext_len is not None and ext_len <= len(ahead_chunk):
+                        return ahead_chunk[:ext_len], ext_len, False
+                except Exception:
+                    pass
+                finally:
+                    reader.seek(curr_pos)
         elif ext == "7z":
             length = parse_7z_size(sub, 0)
         elif ext in ("mp4", "mov", "m4a", "heic"):
             length = parse_isobmff_size(sub, 0)
         elif ext == "jpg":
             length = parse_jpeg_size(sub, 0)
+            if length is None and reader is not None:
+                curr_pos = reader.tell()
+                try:
+                    reader.seek(abs_offset)
+                    ahead_chunk = reader.read(min(MAX_CARVE_FILE_SIZE, 16 * 1024 * 1024))
+                    ext_len = parse_jpeg_size(ahead_chunk, 0)
+                    if ext_len is not None and ext_len <= len(ahead_chunk):
+                        return ahead_chunk[:ext_len], ext_len, False
+                except Exception:
+                    pass
+                finally:
+                    reader.seek(curr_pos)
         elif ext == "pdf":
             length = parse_pdf_size(sub, 0)
+            if length is None and reader is not None:
+                curr_pos = reader.tell()
+                try:
+                    reader.seek(abs_offset)
+                    ahead_chunk = reader.read(min(MAX_CARVE_FILE_SIZE, 32 * 1024 * 1024))
+                    ext_len = parse_pdf_size(ahead_chunk, 0)
+                    if ext_len is not None and ext_len <= len(ahead_chunk):
+                        return ahead_chunk[:ext_len], ext_len, False
+                except Exception:
+                    pass
+                finally:
+                    reader.seek(curr_pos)
         elif ext == "gif":
             length = parse_gif_size(sub, 0)
 
+        # If length was identified from header but sub_len is truncated across chunk boundary
         if length is not None:
             if length <= sub_len and length <= MAX_CARVE_FILE_SIZE:
                 return sub[:length], length, False
             elif sub_len < length:
+                if reader is not None and length <= MAX_CARVE_FILE_SIZE:
+                    curr_pos = reader.tell()
+                    try:
+                        reader.seek(abs_offset)
+                        full_bytes = reader.read(length)
+                        if len(full_bytes) == length:
+                            return full_bytes, length, False
+                    except Exception:
+                        pass
+                    finally:
+                        reader.seek(curr_pos)
+
                 # File appears truncated or fragmented
                 is_fragmented = True
                 return sub[:sub_len], sub_len, True
@@ -206,7 +288,7 @@ class SignatureScanner:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         item_callback: Optional[Callable[[CarvedItem], None]] = None
     ) -> List[CarvedItem]:
-        """Scans a physical drive, raw volume, or disk image file in chunks with overlap."""
+        """Scans a physical drive, raw volume, or disk image file in chunks with overlap and boundary preservation."""
         from engine.win32_raw_reader import Win32RawDeviceReader
 
         with Win32RawDeviceReader(file_path) as reader:
@@ -215,6 +297,7 @@ class SignatureScanner:
             logger.info(f"Initiating signature carving on {dev_label} ({file_size} bytes)...")
 
             results: List[CarvedItem] = []
+            seen_offsets = set()
             offset = 0
             carry_over = b""
 
@@ -222,13 +305,31 @@ class SignatureScanner:
                 chunk = reader.read(CHUNK_SIZE)
                 if not chunk:
                     if carry_over:
-                        items = self.scan_bytes(carry_over, base_offset=offset, item_callback=item_callback)
-                        results.extend(items)
+                        base_offset = max(0, offset - len(carry_over))
+                        items = self.scan_bytes(
+                            carry_over,
+                            base_offset=base_offset,
+                            item_callback=item_callback,
+                            reader=reader
+                        )
+                        for itm in items:
+                            if itm.offset not in seen_offsets:
+                                seen_offsets.add(itm.offset)
+                                results.append(itm)
                     break
 
                 buffer = carry_over + chunk
-                items = self.scan_bytes(buffer, base_offset=offset, item_callback=item_callback)
-                results.extend(items)
+                base_offset = max(0, offset - len(carry_over))
+                items = self.scan_bytes(
+                    buffer,
+                    base_offset=base_offset,
+                    item_callback=item_callback,
+                    reader=reader
+                )
+                for itm in items:
+                    if itm.offset not in seen_offsets:
+                        seen_offsets.add(itm.offset)
+                        results.append(itm)
 
                 bytes_processed = min(offset + len(chunk), file_size) if file_size > 0 else (offset + len(chunk))
                 if progress_callback and file_size > 0:

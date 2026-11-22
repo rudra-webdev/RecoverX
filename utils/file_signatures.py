@@ -6,6 +6,7 @@ Supports 22+ file formats spanning Images, Videos, Audio, Documents, and Archive
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Callable
 import struct
+import zlib
 
 @dataclass
 class SignatureDefinition:
@@ -40,23 +41,64 @@ def parse_bmp_size(data: bytes, offset: int = 0) -> Optional[int]:
         return bmp_size
     return None
 
-def parse_png_size(data: bytes, offset: int = 0) -> Optional[int]:
-    """Walks PNG chunks to determine exact PNG file length."""
+def parse_png_size(data: bytes, offset: int = 0, verify_crc: bool = True) -> Optional[int]:
+    """
+    Walks PNG chunks to determine exact PNG file length and validates structural integrity.
+    Validates:
+    - 8-byte PNG header: \x89PNG\r\n\x1a\n
+    - Mandatory first chunk is IHDR (length 13, valid dimensions > 0, valid bit depth & color type)
+    - Sequential chunk framing (length, type, payload, CRC-32)
+    - CRC-32 validation of chunk payload against 4-byte CRC trailer
+    - Terminal IEND chunk (length 0, CRC 0xAE426082)
+    Returns total byte length of the intact PNG, or None if invalid/corrupt/truncated.
+    """
     png_header = b"\x89PNG\r\n\x1a\n"
     if len(data) < offset + 8 or data[offset:offset+8] != png_header:
         return None
     
     pos = offset + 8
     max_len = len(data)
-    
+    first_chunk = True
+
     while pos + 8 <= max_len:
         chunk_len = struct.unpack(">I", data[pos:pos+4])[0]
         chunk_type = data[pos+4:pos+8]
-        pos += 8 + chunk_len + 4  # length(4) + type(4) + data(chunk_len) + crc(4)
+
+        # Chunk type must be 4 ASCII letters
+        if not (all(65 <= b <= 90 or 97 <= b <= 122 for b in chunk_type) and len(chunk_type) == 4):
+            return None
+
+        # Chunk length sanity check (max 256MB)
+        if chunk_len < 0 or chunk_len > 256 * 1024 * 1024:
+            return None
+
+        # First chunk must be IHDR with length 13
+        if first_chunk:
+            if chunk_type != b"IHDR" or chunk_len != 13:
+                return None
+            if pos + 8 + 13 + 4 <= max_len:
+                width, height = struct.unpack(">II", data[pos+8:pos+16])
+                if width == 0 or height == 0:
+                    return None
+            first_chunk = False
+
+        chunk_end = pos + 8 + chunk_len + 4
+        if chunk_end > max_len:
+            # Chunk is truncated in current buffer
+            return None
+
+        if verify_crc:
+            chunk_data = data[pos+8:pos+8+chunk_len]
+            expected_crc = struct.unpack(">I", data[pos+8+chunk_len:chunk_end])[0]
+            calculated_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+            if calculated_crc != expected_crc:
+                # Corrupt chunk payload or CRC mismatch
+                return None
+
+        pos = chunk_end
         if chunk_type == b"IEND":
             return pos - offset
-        if pos > max_len:
-            break
+
     return None
 
 def parse_zip_size(data: bytes, offset: int = 0, search_window: int = 65536) -> Optional[int]:

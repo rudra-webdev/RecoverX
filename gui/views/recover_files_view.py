@@ -415,13 +415,45 @@ class RecoverFilesView(QWidget):
 
     def _on_scan_finished(self, summary: dict):
         self.progress_bar.setValue(100)
-        self.lbl_scan_status.setText("Scan Complete. Ready to filter and extract.")
         self.btn_start_scan.setEnabled(True)
         self.btn_cancel.setVisible(False)
+
+        total_items = summary.get("total_items", 0)
+        bytes_scanned = summary.get("bytes_scanned", summary.get("file_size", 0))
+        scanned_mb = bytes_scanned / (1024 * 1024)
+
+        if bytes_scanned == 0 and total_items == 0:
+            self.lbl_scan_status.setText("Scan Warning: 0 bytes processed.")
+            QMessageBox.warning(
+                self,
+                "Scan Warning — 0 Bytes Processed",
+                f"The scan completed but 0 bytes were read from:\n{summary.get('source_path')}\n\n"
+                "Possible reasons:\n"
+                "1. Direct read access to raw storage devices on Windows requires Administrator privileges.\n"
+                "2. The selected storage media was disconnected or unreadable.\n"
+                "3. Source image file is empty (0 bytes)."
+            )
+            return
+
+        if total_items == 0:
+            self.lbl_scan_status.setText(f"Scan complete: {scanned_mb:.1f} MB processed. 0 artifacts found.")
+            QMessageBox.information(
+                self,
+                "Scan Complete — No Artifacts",
+                f"Forensic scan completed.\n\n"
+                f"Source: {summary.get('source_path')}\n"
+                f"Data Processed: {scanned_mb:.1f} MB\n"
+                f"Artifacts Discovered: 0\n\n"
+                "No deleted files with recognizable signatures were found in unallocated space."
+            )
+            return
+
+        self.lbl_scan_status.setText(f"Scan Complete: {total_items} artifacts found ({scanned_mb:.1f} MB processed).")
         QMessageBox.information(
             self,
             "Scan Complete",
             f"Forensic scan finished successfully!\n\n"
+            f"Data Processed: {scanned_mb:.1f} MB\n"
             f"Total Artifacts Discovered: {summary['total_items']}\n"
             f"Valid Files: {summary['valid_items']}\n"
             f"Duplicates Identified: {summary['duplicate_items']}\n\n"

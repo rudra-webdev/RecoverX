@@ -12,6 +12,7 @@ import os
 
 from engine.signature_scanner import CarvedItem
 from engine.file_validator import FileValidator
+from engine.win32_raw_reader import Win32RawDeviceReader, is_raw_device_path, normalize_device_path
 from utils.hashing import compute_sha256
 from utils.logging_config import logger
 from config import RECOVERED_DIR
@@ -27,23 +28,35 @@ class RecoveryManager:
         Validates that output destination is strictly isolated from source media.
         Raises PermissionError if output overlaps with or is inside source media.
         """
-        source_resolved = Path(source_path).resolve()
+        is_raw = is_raw_device_path(source_path)
         output_resolved = Path(output_dir).resolve()
 
-        if output_resolved == source_resolved:
-            raise PermissionError(
-                f"Forensic Safety Violation: Output directory ({output_resolved}) cannot be identical to source media ({source_resolved})."
-            )
+        if is_raw:
+            norm_dev = normalize_device_path(str(source_path)).upper()
+            out_drive = output_resolved.drive.upper()
+            if len(norm_dev) == 6 and norm_dev.startswith("\\\\.\\") and norm_dev[5] == ":":
+                dev_letter = norm_dev[4:6]
+                if out_drive == dev_letter:
+                    raise PermissionError(
+                        f"Forensic Safety Violation: Output directory ({output_resolved}) is located on the source drive ({dev_letter}). "
+                        "To prevent overwriting deleted data, please select a different physical or logical drive."
+                    )
+        else:
+            source_resolved = Path(source_path).resolve()
+            if output_resolved == source_resolved:
+                raise PermissionError(
+                    f"Forensic Safety Violation: Output directory ({output_resolved}) cannot be identical to source media ({source_resolved})."
+                )
 
-        if output_resolved in source_resolved.parents:
-            raise PermissionError(
-                f"Forensic Safety Violation: Output directory ({output_resolved}) contains source media ({source_resolved})."
-            )
+            if output_resolved in source_resolved.parents:
+                raise PermissionError(
+                    f"Forensic Safety Violation: Output directory ({output_resolved}) contains source media ({source_resolved})."
+                )
 
-        if source_resolved in output_resolved.parents:
-            raise PermissionError(
-                f"Forensic Safety Violation: Output directory ({output_resolved}) is located inside source media ({source_resolved})."
-            )
+            if source_resolved in output_resolved.parents:
+                raise PermissionError(
+                    f"Forensic Safety Violation: Output directory ({output_resolved}) is located inside source media ({source_resolved})."
+                )
 
     def recover_carved_items(
         self,
@@ -94,8 +107,8 @@ class RecoveryManager:
 
         # Open source file in read-only mode for reading carved offsets if needed
         source_file_handle = None
-        source_is_device = str(source_path).startswith("\\\\.\\")
-        if source_is_device or source_resolved.is_file():
+        source_is_device = is_raw_device_path(source_path)
+        if source_is_device or (not source_is_device and Path(source_path).is_file()):
             try:
                 from engine.win32_raw_reader import Win32RawDeviceReader
                 source_file_handle = Win32RawDeviceReader(source_path)
